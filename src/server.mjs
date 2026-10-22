@@ -4,24 +4,32 @@ import { z } from 'zod';
 import { Bridge } from './bridge.mjs';
 
 const bridge = new Bridge();
-const server = new McpServer({ name: 'dsh-codex', version: '1.0.0' });
+const server = new McpServer({ name: 'dsh-codex', version: '1.3.0' });
 const respond = fn => async args => {
   try { return { content: [{ type: 'text', text: JSON.stringify(await fn(args), null, 2) }] }; }
   catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
 };
 server.registerTool('dsh_health', { description: '检查本地 DSH Desktop 执行入口与日志位置，不启动模型。', inputSchema: {} }, respond(() => bridge.health()));
 server.registerTool('dsh_start', {
-  description: '把 GPT 整理好的代码任务提示词交给本机 DSH 执行。会修改指定工作目录中的文件。立即返回任务 ID，使用 dsh_result 查询。',
+  description: '把任务交给 DSH 实现并自检，会修改项目。默认等待最多45秒并返回简短结果；未结束用 dsh_result 等待。',
   inputSchema: {
     workspace: z.string().describe('要修改的项目绝对目录'),
     prompt: z.string().min(1).max(200000).describe('GPT 编写的任务：目标、上下文、范围、约束和实现指引'),
     acceptance: z.array(z.string()).max(50).optional().describe('可检查的验收标准'),
     timeoutSeconds: z.number().int().min(10).max(7200).optional(),
+    waitSeconds: z.number().int().min(0).max(45).optional().describe('服务端等待秒数，默认45，减少轮询'),
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-}, respond(args => bridge.start(args)));
-server.registerTool('dsh_result', { description: '读取 DSH 任务状态与输出日志。completed 仅表示 DSH 正常退出，仍需检查代码与验收结果。', inputSchema: { id: z.string() }, annotations: { readOnlyHint: true } }, respond(({ id }) => bridge.get(id)));
-server.registerTool('dsh_list', { description: '列出最近三十次 DSH 任务。', inputSchema: {}, annotations: { readOnlyHint: true } }, respond(() => bridge.list()));
+}, respond(async args => {
+  const job = await bridge.start(args);
+  return bridge.compactResult(job.id, { waitSeconds: args.waitSeconds });
+}));
+server.registerTool('dsh_result', {
+  description: '等待并返回简短任务摘要，默认不回传原始日志。completed仍需验收；排障可选full。',
+  inputSchema: { id: z.string(), waitSeconds: z.number().int().min(0).max(45).optional(), detail: z.enum(['summary', 'full']).optional(), afterRevision: z.string().optional().describe('上次返回的revision，未变化时不重复报告'), offset: z.number().int().min(0).optional(), maxChars: z.number().int().min(100).max(4000).optional() },
+  annotations: { readOnlyHint: true },
+}, respond(({ id, ...options }) => bridge.compactResult(id, options)));
+server.registerTool('dsh_list', { description: '列出最近十次任务的简短状态，不返回报告或日志。', inputSchema: {}, annotations: { readOnlyHint: true } }, respond(() => bridge.compactList()));
 server.registerTool('dsh_cancel', { description: '终止当前 DSH 任务进程，保留已写入文件及执行日志。', inputSchema: { id: z.string() } }, respond(({ id }) => bridge.cancel(id)));
 server.server.onclose = () => bridge.shutdown();
 process.on('SIGTERM', () => { bridge.shutdown(); process.exit(0); });

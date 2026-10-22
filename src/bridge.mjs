@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync, closeSync, unlinkSync, realpathSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync, closeSync, unlinkSync, realpathSync, statSync, readdirSync, renameSync } from 'node:fs';
 import { join, resolve, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -19,7 +19,7 @@ export function discover(env = process.env) {
 }
 
 export function makePrompt({ prompt, acceptance = [] }) {
-  return `你是本次任务的代码执行者。上游 GPT/Codex 已整理以下任务，请直接在当前工作目录实现。\n遵守项目 AGENTS.md 和现有代码规范，保留无关改动。遇到缺失凭据或必须人工确认的操作，明确报告阻塞，不要假称完成。不要把实现任务再转交给 Codex。\n\n任务提示词：\n${prompt}\n\n验收标准：\n${acceptance.length ? acceptance.map((s, i) => `${i + 1}. ${s}`).join('\n') : '完成任务，并运行与改动相关的检查。'}\n\n最后用中文报告：实际修改的文件、实现要点、执行过的检查及结果、尚未完成的事项。`;
+  return `你是本次任务的代码执行者。上游 GPT/Codex 已整理以下任务，请直接在当前工作目录实现。\n遵守项目 AGENTS.md 和现有代码规范，保留无关改动。遇到缺失凭据或必须人工确认的操作，明确报告阻塞，不要假称完成。不要把实现任务再转交给 Codex。\n\n任务提示词：\n${prompt}\n\n验收标准：\n${acceptance.length ? acceptance.map((s, i) => `${i + 1}. ${s}`).join('\n') : '完成任务，并运行与改动相关的检查。'}\n\n最后用中文报告实际修改的文件、实现要点、执行过的检查及结果、失败和未验证事项。保留完整验收证据，不设字数限制，不把未执行的检查称为通过。`;
 }
 
 function alive(pid) {
@@ -44,12 +44,17 @@ export class Bridge {
     const dir = join(this.config.data, id);
     return { dir, status: join(dir, 'status.json'), stdout: join(dir, 'stdout.log'), stderr: join(dir, 'stderr.log') };
   }
-  save(job) { writeFileSync(this.paths(job.id).status, JSON.stringify(job, null, 2)); }
+  save(job) {
+    const target = this.paths(job.id).status;
+    const temp = `${target}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify(job, null, 2));
+    renameSync(temp, target);
+  }
   get(id) {
     const paths = this.paths(id);
     if (!existsSync(paths.status)) throw new Error('找不到该任务');
     const job = JSON.parse(readFileSync(paths.status, 'utf8'));
-    if (job.state === 'running' && !this.running.has(id)) {
+    if (['running', 'cancelling'].includes(job.state) && !this.running.has(id) && !(job.ownerPid && alive(job.ownerPid))) {
       job.state = 'interrupted';
       job.error = '所属桥接服务已断开；执行进程可能仍在运行，请检查日志和工作区后再提交。';
     }
@@ -59,6 +64,50 @@ export class Bridge {
     return readdirSync(this.config.data).filter(id => /^[0-9a-f-]{36}$/.test(id))
       .map(id => { const { stdout, stderr, ...job } = this.get(id); return job; })
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 30);
+  }
+  async compactResult(id, { waitSeconds = 45, detail = 'summary', afterRevision, offset = 0, maxChars = 1600 } = {}) {
+    const deadline = Date.now() + Math.max(0, Math.min(45, waitSeconds)) * 1000;
+    let job = this.get(id);
+    while (['running', 'cancelling'].includes(job.state) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, deadline - Date.now())));
+      job = this.get(id);
+    }
+    if (detail === 'full') return job;
+    const response = { id, state: job.state, exitCode: job.exitCode, logDirectory: job.logDirectory };
+    const delta = () => {
+      const revision = createHash('sha256').update(JSON.stringify(response)).digest('hex').slice(0, 16);
+      return revision === afterRevision ? { id, state: job.state, revision, unchanged: true } : { ...response, revision };
+    };
+    if (['running', 'cancelling'].includes(job.state)) {
+      response.next = '任务仍在运行；下次调用 dsh_result 使用 waitSeconds=45 并携带 afterRevision。';
+      return delta();
+    }
+    const rawReport = readFileSync(this.paths(id).stdout, 'utf8');
+    let parsed = job.result;
+    if (!parsed) { try { parsed = JSON.parse(rawReport); } catch {} }
+    const report = typeof parsed?.result === 'string' ? parsed.result : rawReport;
+    const start = Math.max(0, Math.floor(offset));
+    const size = Math.max(100, Math.min(4000, Math.floor(maxChars)));
+    response.summary = report.slice(start, start + size);
+    response.truncated = report.length > start + size;
+    response.reportChars = report.length;
+    response.unreadChars = Math.max(0, report.length - start - size);
+    response.reviewRequired = true;
+    response.diagnosticAvailable = Boolean(job.stderr.trim());
+    // Preserve visibility of denials even when the CLI otherwise reports success.
+    try {
+      const raw = JSON.parse(rawReport);
+      if (Array.isArray(raw.permission_denials)) response.permissionDenialCount = raw.permission_denials.length;
+    } catch {}
+    if (response.truncated) response.nextOffset = start + size;
+    if (start) response.offset = start;
+    if (job.error) response.error = String(job.error).slice(0, 800);
+    if (job.state !== 'completed') response.diagnostic = job.stderr.slice(-1000);
+    response.next = response.truncated ? '报告未读完；必须用 offset=nextOffset 读完再验收。' : '报告读完不等于验收通过：独立审查实际差异并执行必要测试；有诊断或权限拒绝时核实完整日志。';
+    return delta();
+  }
+  compactList() {
+    return this.list().slice(0, 10).map(({ id, state, workspace, startedAt, exitCode }) => ({ id, state, workspace, startedAt, exitCode }));
   }
   async start({ workspace, prompt, acceptance = [], timeoutSeconds = 1200 }) {
     if (!isAbsolute(workspace)) throw new Error('工作目录必须是绝对路径');
@@ -88,7 +137,7 @@ export class Bridge {
         cwd, env: { ...process.env, DSH_HOME: this.config.home },
         shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
       });
-      const job = { id, workspace: cwd, state: 'running', startedAt: new Date().toISOString(), pid: child.pid ?? null, exitCode: null };
+      const job = { id, ownerPid: process.pid, workspace: cwd, state: 'running', startedAt: new Date().toISOString(), pid: child.pid ?? null, exitCode: null };
       writeFileSync(lock, JSON.stringify({ pid: process.pid, childPid: child.pid, id }));
       this.save(job);
       let finished = false;
@@ -140,5 +189,9 @@ export class Bridge {
     this.kill(active.child);
     return { id, state: 'cancelling', note: '取消不会撤回已经写入的文件。' };
   }
-  shutdown() { for (const { child } of this.running.values()) this.kill(child); }
+  shutdown() {
+    for (const { child, job } of this.running.values()) {
+      job.state = 'interrupted'; this.save(job); this.kill(child);
+    }
+  }
 }
